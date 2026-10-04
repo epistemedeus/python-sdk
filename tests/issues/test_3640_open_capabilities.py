@@ -371,6 +371,8 @@ async def test_http_discover_wire_bytes_and_sdk_client_read_the_same_keys() -> N
 
     async with Client(server, mode="auto") as client:
         dumped = client.server_capabilities.model_dump(by_alias=True, exclude_none=True)
+        listed = await client.list_tools()
+        assert listed.tools == []
     assert dumped["events"] == _EVENTS_VALUE
     assert dumped[_HOOKS] == _HOOKS_VALUE
     assert dumped["extensions"] == {"io.modelcontextprotocol/ui": {}}
@@ -384,3 +386,23 @@ async def test_http_discover_wire_bytes_and_sdk_client_read_the_same_keys() -> N
     assert dumped[_HOOKS] == _HOOKS_VALUE
     assert "extensions" not in dumped
     assert dumped["tools"] == {"listChanged": False}
+
+
+def test_capability_sieve_leaves_non_object_capabilities_unchanged() -> None:
+    """The defensive sieve must not invent capabilities on an incomplete result."""
+    for original in ({}, {"capabilities": None}, {"capabilities": []}):
+        payload = dict(original)
+        methods._drop_cross_era_server_capability_keys("server/discover", "2026-07-28", payload)
+        assert payload == original
+
+
+async def test_discover_only_context_refuses_outgoing_operations() -> None:
+    """The isolated discover harness never provides a hidden callback transport."""
+    ctx = _StubDispatchContext()
+    assert not ctx.can_send_request
+    with pytest.raises(NotImplementedError):
+        await ctx.send_raw_request("fixture/request", {})
+    with pytest.raises(NotImplementedError):
+        await ctx.notify("fixture/notification", {})
+    with pytest.raises(NotImplementedError):
+        await ctx.progress(1.0)
