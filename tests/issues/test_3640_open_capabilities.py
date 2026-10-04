@@ -390,7 +390,8 @@ async def test_http_discover_wire_bytes_and_sdk_client_read_the_same_keys() -> N
 
 def test_capability_sieve_leaves_non_object_capabilities_unchanged() -> None:
     """The defensive sieve must not invent capabilities on an incomplete result."""
-    for original in ({}, {"capabilities": None}, {"capabilities": []}):
+    cases: tuple[dict[str, Any], ...] = ({}, {"capabilities": None}, {"capabilities": []})
+    for original in cases:
         payload = dict(original)
         methods._drop_cross_era_server_capability_keys("server/discover", "2026-07-28", payload)
         assert payload == original
