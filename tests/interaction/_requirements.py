@@ -3134,11 +3134,22 @@ REQUIREMENTS: dict[str, Requirement] = {
         note="Only observable over HTTP: 415 is an HTTP status code.",
         divergence=Divergence(
             note=(
-                "The transport-security middleware rejects a non-JSON Content-Type with 400 'Invalid "
-                "Content-Type header' before the request reaches the transport, so the transport's own 415 "
-                "path is unreachable through any public entry point."
+                "The transport-security middleware rejects a Content-Type that does not start with "
+                "application/json, in any case, with 400 'Invalid Content-Type header' before the "
+                "transport. A value that starts with that prefix but is a different media type reaches "
+                "the transport and returns 415. application/json itself is accepted in any case "
+                "(issue #3670)."
             ),
         ),
+    ),
+    "hosting:http:content-type-case": Requirement(
+        source="issue:#3670",
+        behavior=(
+            "A POST whose Content-Type media type is application/json is accepted regardless of letter "
+            "case and regardless of parameters after the type."
+        ),
+        transports=("streamable-http",),
+        note="RFC 9110 §8.3.1: media types are case-insensitive. Regression lock for issue #3670.",
     ),
     "hosting:http:disconnect-not-cancel": Requirement(
         source=f"{SPEC_BASE_URL}/basic/transports#sending-messages-to-the-server",

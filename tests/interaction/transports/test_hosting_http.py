@@ -118,17 +118,56 @@ async def test_missing_accept_media_types_return_406() -> None:
 
 @requirement("hosting:http:content-type-415")
 async def test_non_json_content_type_is_rejected() -> None:
-    """A POST with a non-JSON Content-Type is rejected before reaching the transport.
+    """A POST whose Content-Type does not start with application/json is rejected by middleware with 400.
 
-    See the divergence on the requirement: the security middleware rejects with 400, so the
-    transport's own 415 path is unreachable through any public entry point.
+    See the divergence on the requirement: the security middleware answers this class with 400.
+    A prefix that is not the application/json media type still reaches the transport's 415.
     """
     async with mounted_app(_server()) as (http, _):
         response = await http.post(
             "/mcp", content=b"<not-json/>", headers=base_headers() | {"content-type": "text/plain"}
         )
+        mixed_case = await http.post(
+            "/mcp", content=b"<not-json/>", headers=base_headers() | {"content-type": "Text/Plain"}
+        )
 
     assert (response.status_code, response.text) == snapshot((400, "Invalid Content-Type header"))
+    assert (mixed_case.status_code, mixed_case.text) == (400, "Invalid Content-Type header")
+
+
+@requirement("hosting:http:content-type-case")
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/json",
+        "Application/JSON",
+        "APPLICATION/JSON",
+        "application/json; charset=utf-8",
+        "Application/JSON; charset=UTF-8",
+    ],
+)
+async def test_json_content_type_is_case_insensitive(content_type: str) -> None:
+    """application/json matches any letter case, with or without media-type parameters."""
+    async with mounted_app(_server()) as (http, _):
+        response = await http.post(
+            "/mcp", json=initialize_body(), headers=base_headers() | {"content-type": content_type}
+        )
+
+    assert response.status_code == 200
+    assert '"id":1' in response.text
+    assert "Unsupported Media Type" not in response.text
+
+
+@requirement("hosting:http:content-type-415")
+async def test_json_prefix_that_is_not_json_returns_415() -> None:
+    """A media type that only shares the application/json prefix is the transport's 415, not a 400."""
+    async with mounted_app(_server()) as (http, _):
+        response = await http.post(
+            "/mcp", content=b"{}", headers=base_headers() | {"content-type": "application/json-patch+json"}
+        )
+
+    assert response.status_code == 415
+    assert "Unsupported Media Type" in response.text
 
 
 @requirement("hosting:http:parse-error-400")
