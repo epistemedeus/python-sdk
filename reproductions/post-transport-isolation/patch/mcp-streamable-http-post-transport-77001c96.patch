@@ -1,0 +1,316 @@
+diff --git a/docs/client/transports.md b/docs/client/transports.md
+index b41fe51..2c80de8 100644
+--- a/docs/client/transports.md
++++ b/docs/client/transports.md
+@@ -102,6 +102,12 @@ This holds for any `httpx2.AsyncClient` you pass in: its `follow_redirects` sett
+     That is fixed on the server (**[Deploy & scale](../run/deploy.md#behind-a-tls-terminating-proxy)**),
+     or by using the exact `https://…/` URL the message suggests.
+ 
++### Network errors
++
++Once connected, a network failure on one message's POST (a connection error, or a timeout sending it or reading its JSON response) affects only that message. A request fails with `MCPError` code `CONNECTION_CLOSED`, whose message names the original `httpx2` exception. A notification is dropped. Other calls in flight and later calls on the same session carry on. The SDK does not send the failed request again, so whether to retry is up to you. The original exception is also logged and delivered to your [`message_handler`](callbacks.md).
++
++While connecting, the raw `httpx2` exception still propagates out of `Client(...)`: a server you cannot reach is an outage, not a failed call.
++
+ ## stdio
+ 
+ A **stdio** server is a subprocess. The client launches it, writes JSON-RPC to its stdin and reads JSON-RPC from its stdout. It is how a desktop host runs a server on your machine: a host *is* this code plus a UI, and **[Connect to a real host](../get-started/real-host.md)** is the same relationship seen from the host's side, as a config file.
+diff --git a/src/mcp/client/streamable_http.py b/src/mcp/client/streamable_http.py
+index 053f1f1..fe7ad37 100644
+--- a/src/mcp/client/streamable_http.py
++++ b/src/mcp/client/streamable_http.py
+@@ -160,6 +160,10 @@ class StreamableHTTPTransport:
+         """Check if the message is an initialization request."""
+         return isinstance(message, JSONRPCRequest) and message.method == "initialize"
+ 
++    def _is_connect_negotiation_request(self, message: JSONRPCMessage) -> bool:
++        """Check if the message is a connect-time handshake or era probe."""
++        return isinstance(message, JSONRPCRequest) and message.method in ("initialize", "server/discover")
++
+     def _is_initialized_notification(self, message: JSONRPCMessage) -> bool:
+         """Check if the message is an initialized notification."""
+         return isinstance(message, JSONRPCNotification) and message.method == "notifications/initialized"
+@@ -361,6 +365,31 @@ class StreamableHTTPTransport:
+                 del self._in_flight_posts[request_id]
+ 
+     async def _handle_post_request(self, ctx: RequestContext) -> None:
++        """POST one message, containing a transport failure to that message.
++
++        A request is resolved with CONNECTION_CLOSED and a notification is dropped, so one
++        failed POST neither tears down the transport nor ends `post_writer`. Connect-time
++        negotiation re-raises: auto mode reads a raw network error as an outage, not an era verdict.
++        Caller cancellation is not a transport error and still propagates. The failed request
++        is not sent again: an unknown effect stays unknown.
++        """
++        message = ctx.session_message.message
++        try:
++            await self._send_post_request(ctx)
++        except httpx2.TransportError as exc:
++            if self._is_connect_negotiation_request(message):
++                raise
++            logger.exception("POST for %s failed", getattr(message, "method", "a response"))
++            try:
++                await ctx.read_stream_writer.send(exc)
++            except (anyio.BrokenResourceError, anyio.ClosedResourceError):
++                logger.debug("read stream closed before the POST failure could be surfaced")
++            if isinstance(message, JSONRPCRequest):
++                await self._resolve_abandoned_request(
++                    ctx.read_stream_writer, message.id, f"HTTP request failed: {exc!r}"
++                )
++
++    async def _send_post_request(self, ctx: RequestContext) -> None:
+         """Handle a POST request with response processing."""
+         message = ctx.session_message.message
+         headers = self._prepare_headers()
+diff --git a/tests/client/test_streamable_http.py b/tests/client/test_streamable_http.py
+index 9087394..ad2f5e4 100644
+--- a/tests/client/test_streamable_http.py
++++ b/tests/client/test_streamable_http.py
+@@ -8,7 +8,7 @@ that the public client never exposes.
+ import base64
+ import json
+ from collections.abc import AsyncIterator, Callable, Mapping
+-from typing import Any
++from typing import Any, Literal
+ 
+ import anyio
+ import httpx2
+@@ -1279,3 +1279,238 @@ Redirect to http://backend.lan:8000/mcp/ not followed: it would downgrade this H
+ The server is likely behind a TLS-terminating proxy whose forwarded headers it does not trust,
+ often combined with a trailing-slash difference. Try https://backend.lan:8000/mcp/ instead, or fix the proxy settings.\
+ """)
++
++
++class _BodyError(httpx2.AsyncByteStream):
++    def __init__(self, error: BaseException) -> None:
++        self._error = error
++
++    async def __aiter__(self) -> AsyncIterator[bytes]:
++        yield b"{"
++        raise self._error
++
++
++class _FailPostsFor(httpx2.AsyncBaseTransport):
++    """Serves `app` in process, except that a POST carrying `method` fails with a transport error:
++    raised while sending it, or (`in_body`) while reading its JSON response body."""
++
++    def __init__(
++        self,
++        app: Starlette,
++        method: str,
++        *,
++        in_body: bool = False,
++        error: type[httpx2.TransportError] = httpx2.ReadTimeout,
++    ) -> None:
++        self.inner = StreamingASGITransport(app)
++        self.method = method
++        self.in_body = in_body
++        self.error = error
++        self.posts: list[str] = []
++
++    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
++        await request.aread()
++        body = json.loads(request.content) if request.method == "POST" else {}
++        if request.method == "POST":
++            self.posts.append(body.get("method", ""))
++        if request.method == "POST" and body.get("method") == self.method:
++            exc = self.error("simulated transport failure")
++            if self.in_body:
++                return httpx2.Response(200, headers={"content-type": "application/json"}, stream=_BodyError(exc))
++            raise exc
++        return await self.inner.handle_async_request(request)
++
++    async def __aenter__(self) -> "_FailPostsFor":
++        await self.inner.__aenter__()
++        return self
++
++    async def __aexit__(self, *args: Any) -> None:
++        await self.inner.__aexit__(*args)
++
++
++async def _list_no_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
++    return ListToolsResult(tools=[])
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("in_body", [False, True], ids=["sending", "reading-json-body"])
++@pytest.mark.parametrize(
++    "error",
++    [httpx2.ReadTimeout, httpx2.RemoteProtocolError, httpx2.ConnectError],
++    ids=["read-timeout", "remote-protocol", "connect"],
++)
++async def test_post_transport_error_fails_that_call_and_keeps_the_session(
++    in_body: bool, error: type[httpx2.TransportError]
++) -> None:
++    """A transport error on one request's POST fails only that call with CONNECTION_CLOSED.
++
++    The original exception reaches message_handler. The session stays usable. The failed
++    request is not replayed.
++    """
++    session_manager = StreamableHTTPSessionManager(app=Server("post-error-test", on_list_tools=_list_no_tools))
++    app = Starlette(routes=[Mount("/mcp", app=session_manager.handle_request)])
++    seen: list[object] = []
++    delivered = anyio.Event()
++
++    async def message_handler(message: object) -> None:
++        seen.append(message)
++        delivered.set()
++
++    transport = _FailPostsFor(app, "prompts/list", in_body=in_body, error=error)
++
++    with anyio.fail_after(5):
++        async with (
++            session_manager.run(),
++            httpx2.AsyncClient(transport=transport) as http,
++            Client(
++                streamable_http_client("http://mcp.example/mcp/", http_client=http),
++                message_handler=message_handler,
++            ) as client,
++        ):
++            with pytest.raises(MCPError) as exc_info:
++                await client.list_prompts()
++            assert (await client.list_tools()).tools == []
++            await delivered.wait()
++            assert not http.is_closed
++
++    assert exc_info.value.error.code == CONNECTION_CLOSED
++    assert exc_info.value.error.message == f"HTTP request failed: {error('simulated transport failure')!r}"
++    assert len(seen) == 1
++    assert isinstance(seen[0], error)
++    assert transport.posts.count("prompts/list") == 1
++
++
++@pytest.mark.anyio
++async def test_post_transport_error_on_a_notification_drops_it_and_keeps_the_session() -> None:
++    """A notification whose POST fails with a transport error is dropped. The next request still completes."""
++
++    def handler(request: httpx2.Request) -> httpx2.Response:
++        body = json.loads(request.content)
++        if body["method"] == "notifications/roots/list_changed":
++            raise httpx2.ReadTimeout("simulated read timeout")
++        return httpx2.Response(
++            200,
++            headers={"content-type": "application/json"},
++            json={"jsonrpc": "2.0", "id": body["id"], "result": {"tools": []}},
++        )
++
++    with anyio.fail_after(5):
++        async with (
++            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
++            streamable_http_client("http://test/mcp", http_client=http) as (read, write),
++        ):
++            await write.send(
++                SessionMessage(JSONRPCNotification(jsonrpc="2.0", method="notifications/roots/list_changed"))
++            )
++            fault = await read.receive()
++            await write.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=7, method="tools/list", params={})))
++            reply = await read.receive()
++            assert not http.is_closed
++    assert isinstance(fault, httpx2.ReadTimeout)
++    assert isinstance(reply, SessionMessage)
++    assert isinstance(reply.message, JSONRPCResponse)
++    assert reply.message.id == 7
++
++
++@pytest.mark.anyio
++async def test_post_transport_error_on_one_call_leaves_a_concurrent_call_in_flight() -> None:
++    """One request's POST failing with a transport error does not cancel another request already in flight."""
++    started = anyio.Event()
++    release = anyio.Event()
++
++    async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
++        return ListToolsResult(tools=[Tool(name="slow", input_schema={"type": "object"})])
++
++    async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) -> CallToolResult:
++        assert params.name == "slow"
++        started.set()
++        await release.wait()
++        return CallToolResult(content=[TextContent(text="done")])
++
++    session_manager = StreamableHTTPSessionManager(
++        app=Server("post-error-test", on_list_tools=list_tools, on_call_tool=call_tool)
++    )
++    app = Starlette(routes=[Mount("/mcp", app=session_manager.handle_request)])
++    results: list[CallToolResult] = []
++
++    with anyio.fail_after(5):
++        async with (
++            session_manager.run(),
++            httpx2.AsyncClient(transport=_FailPostsFor(app, "prompts/list")) as http,
++            Client(streamable_http_client("http://mcp.example/mcp/", http_client=http)) as client,
++        ):
++
++            async def slow_call() -> None:
++                results.append(await client.call_tool("slow", {}))
++
++            async with anyio.create_task_group() as tg:
++                tg.start_soon(slow_call)
++                await started.wait()
++                with pytest.raises(MCPError) as exc_info:
++                    await client.list_prompts()
++                assert exc_info.value.error.code == CONNECTION_CLOSED
++                release.set()
++            assert not http.is_closed
++
++    assert [item.content for item in results] == [[TextContent(text="done")]]
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize(("mode", "method"), [("legacy", "initialize"), ("auto", "server/discover")])
++@pytest.mark.parametrize("error", [httpx2.ConnectError, httpx2.ReadTimeout])
++async def test_post_transport_error_during_connect_negotiation_propagates_raw(
++    mode: Literal["legacy", "auto"], method: str, error: type[httpx2.TransportError]
++) -> None:
++    """A transport error on connect-time initialize or server/discover is not contained.
++
++    Auto mode uses the raw error to tell an outage from a legacy server. No fallback request follows.
++    """
++    methods: list[str] = []
++
++    def handler(request: httpx2.Request) -> httpx2.Response:
++        methods.append(json.loads(request.content)["method"])
++        raise error("network down")
++
++    with anyio.fail_after(5):
++        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
++            with pytest.RaisesGroup(error, flatten_subgroups=True):
++                async with Client(streamable_http_client("http://test/mcp", http_client=http), mode=mode):
++                    pytest.fail("entering the Client should have raised")
++            assert not http.is_closed
++
++    assert methods == [method]
++
++
++@pytest.mark.anyio
++async def test_post_transport_error_after_the_reader_closed_is_contained() -> None:
++    """A POST failing after the session reader closed is dropped and does not crash the transport."""
++
++    def handler(request: httpx2.Request) -> httpx2.Response:
++        raise httpx2.ConnectError("connection refused")
++
++    transport = StreamableHTTPTransport("http://test/mcp")
++    send, receive = create_context_streams[SessionMessage | Exception](1)
++    receive.close()
++    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
++        with anyio.fail_after(5):
++            await transport._handle_post_request(  # pyright: ignore[reportPrivateUsage]
++                _abandoned_request_context(http, send)
++            )
++    send.close()
++
++
++@pytest.mark.anyio
++async def test_a_non_transport_post_error_still_escapes() -> None:
++    """A programmer error on a POST is not rewritten into a per-request CONNECTION_CLOSED."""
++
++    def handler(request: httpx2.Request) -> httpx2.Response:
++        raise RuntimeError("programmer error")
++
++    with anyio.fail_after(5):
++        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
++            with pytest.RaisesGroup(pytest.RaisesExc(RuntimeError, match="programmer error"), flatten_subgroups=True):
++                async with streamable_http_client("http://test/mcp", http_client=http) as (_read, write):
++                    request = JSONRPCRequest(jsonrpc="2.0", id=1, method="tools/list", params={})
++                    await write.send(SessionMessage(request))
++                    await anyio.sleep(1)
++            assert not http.is_closed
