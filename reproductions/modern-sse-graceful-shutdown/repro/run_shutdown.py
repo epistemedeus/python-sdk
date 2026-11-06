@@ -12,8 +12,10 @@ bound, while those two cases exited.
 Exit 2: the idle case, the completed request, or the listen stream did not
 reach the state under test.
 
-``legacy_get`` and ``listen_grace_5`` are recorded and do not select the exit
-code. A return code of -15 is uvicorn re-raising SIGTERM after shutdown. A
+By default legacy_get is recorded, preserving the original command. Explicit
+--expect-legacy and --expect-listen bind both generations to held/drains/clean.
+Prompt drain and a complete chunked response are separate observations.
+``listen_grace_5`` remains a cancellation control. A return code of -15 is uvicorn re-raising SIGTERM after shutdown. A
 return code of -9 is this process sending SIGKILL at the bound.
 
 Stdout is one JSON object. The bound is a measurement cutoff, not a server setting.
@@ -21,6 +23,7 @@ Stdout is one JSON object. The bound is a measurement cutoff, not a server setti
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import http.client
 import importlib.metadata
@@ -118,11 +121,14 @@ def _package_version(name: str) -> str | None:
 
 
 def _source_probe() -> dict[str, Any]:
+    import sse_starlette.sse as sse
+
     import mcp.server._streamable_http_modern as modern
     import mcp.server.streamable_http as legacy
 
     modern_text = Path(modern.__file__).read_text(encoding="utf-8")
     legacy_text = Path(legacy.__file__).read_text(encoding="utf-8")
+    dependency_text = Path(sse.__file__).read_text(encoding="utf-8")
     return {
         "modern_file": modern.__file__,
         "legacy_file": legacy.__file__,
@@ -132,6 +138,9 @@ def _source_probe() -> dict[str, Any]:
         "modern_watch_disconnect": "async def watch_disconnect" in modern_text,
         "modern_should_exit": "should_exit" in modern_text,
         "modern_end_of_stream": modern_text.count("EndOfStream"),
+        "sse_source_sha256": hashlib.sha256(dependency_text.encode()).hexdigest(),
+        "sse_shutdown_watcher": "_shutdown_watcher" in dependency_text,
+        "sse_context_var": "ContextVar" in dependency_text,
     }
 
 
@@ -262,6 +271,7 @@ def _preview(conn: http.client.HTTPConnection, response: http.client.HTTPRespons
 class _Held:
     def __init__(self) -> None:
         self.conn: http.client.HTTPConnection | None = None
+        self.response: http.client.HTTPResponse | None = None
 
     def open(
         self,
@@ -270,19 +280,69 @@ class _Held:
         path: str,
         body: dict[str, Any] | None,
         headers: dict[str, str],
+        read_preview: bool = True,
     ) -> dict[str, Any]:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=OPEN_TIMEOUT_SECONDS)
         self.conn = conn
         raw = None if body is None else json.dumps(body).encode()
         conn.request(method, path, body=raw, headers=headers)
         response = conn.getresponse()
+        self.response = response
         return {
             "status": response.status,
             "content_type": response.getheader("content-type") or "",
-            "preview": _preview(conn, response),
+            # Legacy GET need not emit an initial event. Timing out readline
+            # poisons its buffered reader and hides the later HTTP terminator.
+            "preview": _preview(conn, response) if read_preview else "",
+            "chunked": response.chunked,
         }
 
+    def receive_end(self) -> dict[str, Any]:
+        """Observe framing only AFTER our test server has terminated.
+
+        Successful chunk decoding consumes the final zero-length chunk. An
+        abrupt EOF instead raises IncompleteRead, even when the process drained
+        promptly. This is a wire observation, not an inference from its exit.
+        """
+        response = self.response
+        if response is None:
+            return {"body_complete": None, "final_chunk_received": None}
+        size = 0
+        try:
+            while size < 65536:
+                chunk = response.read1(min(4096, 65536 - size))
+                if not chunk:
+                    return {
+                        "body_complete": True,
+                        "final_chunk_received": True if response.chunked else None,
+                        "remaining_body_bytes": size,
+                    }
+                size += len(chunk)
+            return {
+                "body_complete": None,
+                "final_chunk_received": None,
+                "remaining_body_bytes": size,
+                "error": "capture-limit",
+            }
+        except http.client.IncompleteRead as exc:
+            return {
+                "body_complete": False,
+                "final_chunk_received": False if response.chunked else None,
+                "remaining_body_bytes": size + len(exc.partial),
+                "error": "IncompleteRead",
+            }
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            return {
+                "body_complete": None,
+                "final_chunk_received": None,
+                "remaining_body_bytes": size,
+                "error": type(exc).__name__,
+            }
+
     def close(self) -> None:
+        if self.response is not None:
+            self.response.close()
+            self.response = None
         if self.conn is not None:
             self.conn.close()
             self.conn = None
@@ -348,9 +408,10 @@ def _prepare_legacy(port: int) -> tuple[_Held, dict[str, Any]]:
         "/mcp",
         None,
         {"Accept": "text/event-stream", "mcp-session-id": session, "MCP-Protocol-Version": LEGACY},
+        read_preview=False,
     )
     content_type = str(stream["content_type"]).split(";", 1)[0].strip()
-    stream["ok"] = stream["status"] == 200 and content_type == "text/event-stream"
+    stream["ok"] = stream["status"] == 200 and content_type == "text/event-stream" and note["status"] == 202
     stream["initialize_status"] = init["status"]
     stream["initialized_status"] = note["status"]
     return held, stream
@@ -360,7 +421,23 @@ def _prepare_listen(port: int) -> tuple[_Held, dict[str, Any]]:
     held = _Held()
     stream = held.open(port, "POST", "/mcp", _listen_body(), _modern_headers("subscriptions/listen"))
     content_type = str(stream["content_type"]).split(";", 1)[0].strip()
-    stream["ok"] = stream["status"] == 200 and content_type == "text/event-stream"
+    acknowledged = False
+    for line in str(stream["preview"]).splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            message = json.loads(line[5:].strip())
+            acknowledged = (
+                message.get("jsonrpc") == "2.0"
+                and message.get("method") == "notifications/subscriptions/acknowledged"
+                and message.get("params", {}).get("_meta", {}).get("io.modelcontextprotocol/subscriptionId") == 1
+            )
+        except (ValueError, AttributeError):
+            continue
+        if acknowledged:
+            break
+    stream["acknowledged"] = acknowledged
+    stream["ok"] = stream["status"] == 200 and content_type == "text/event-stream" and acknowledged
     return held, stream
 
 
@@ -380,6 +457,11 @@ def _run_case(name: str, graceful: str | None, bound: float, prepare: str) -> di
         if not detail.get("ok"):
             return {"name": name, "ok": False, "setup": detail, "log": _interesting(server._snapshot())}
         stopped = server.stop(bound)
+        if prepare in {"legacy", "listen"}:
+            stopped["stream_end"] = held.receive_end()
+            stopped["asgi_response_error"] = any(
+                "ASGI callable returned without completing response" in line for line in stopped["log"]
+            )
         return {"name": name, "ok": True, "setup": detail, **stopped}
     except (OSError, http.client.HTTPException, TimeoutError) as exc:
         return {
@@ -397,16 +479,48 @@ def _disposition(cases: dict[str, dict[str, Any]]) -> str:
     idle = cases["idle"]
     closed = cases["modern_closed"]
     listen = cases["listen"]
-    if not idle.get("ok") or idle.get("hung") or not closed.get("ok") or closed.get("hung"):
+    if not _drains(idle) or not _drains(closed):
         return "harness-invalid"
     if not listen.get("ok"):
         return "harness-invalid"
     if listen.get("hung"):
         return "hang-reproduced"
-    return "listen-exits"
+    return "listen-exits" if _drains(listen) else "harness-invalid"
 
 
-def harness() -> int:
+def _drains(case: dict[str, Any]) -> bool:
+    return bool(case.get("ok") and not case.get("hung") and case.get("returncode") in {0, -15})
+
+
+def _matches(case: dict[str, Any], expected: str) -> bool:
+    if expected == "record":
+        return True
+    if not case.get("ok"):
+        return False
+    if expected == "held":
+        return case.get("hung") is True
+    if expected == "drains":
+        return _drains(case)
+    if expected == "clean":
+        return bool(
+            _drains(case)
+            and not case.get("asgi_response_error")
+            and case.get("stream_end", {}).get("final_chunk_received") is True
+        )
+    raise ValueError("unknown expectation")
+
+
+def _selection(cases: dict[str, dict[str, Any]], legacy: str, listen: str) -> dict[str, Any]:
+    invalid = _disposition(cases) == "harness-invalid" or (legacy != "record" and not cases["legacy_get"].get("ok"))
+    checks = {"legacy_get": _matches(cases["legacy_get"], legacy), "listen": _matches(cases["listen"], listen)}
+    return {
+        "expected": {"legacy_get": legacy, "listen": listen},
+        "checks": checks,
+        "exit": 2 if invalid else (0 if all(checks.values()) else 1),
+    }
+
+
+def harness(expected_legacy: str = "record", expected_listen: str = "drains") -> int:
     cases = {
         "idle": _run_case("idle", None, HANG_BOUND_SECONDS, "idle"),
         "modern_closed": _run_case("modern_closed", None, HANG_BOUND_SECONDS, "closed"),
@@ -415,10 +529,11 @@ def harness() -> int:
         "listen_grace_5": _run_case("listen_grace_5", str(GRACE_SECONDS), GRACE_BOUND_SECONDS, "listen"),
     }
     disposition = _disposition(cases)
-    exits = {"hang-reproduced": 1, "listen-exits": 0, "harness-invalid": 2}
+    selection = _selection(cases, expected_legacy, expected_listen)
     report = {
         "disposition": disposition,
-        "exit": exits[disposition],
+        "exit": selection["exit"],
+        "qualification": selection,
         "hang_bound_seconds": HANG_BOUND_SECONDS,
         "grace_seconds": GRACE_SECONDS,
         "grace_bound_seconds": GRACE_BOUND_SECONDS,
@@ -441,7 +556,11 @@ def main() -> int:
         graceful = sys.argv[3] if len(sys.argv) > 3 else None
         serve(int(sys.argv[2]), graceful)
         return 0
-    return harness()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--expect-legacy", choices=("record", "held", "drains", "clean"), default="record")
+    parser.add_argument("--expect-listen", choices=("held", "drains", "clean"), default="drains")
+    args = parser.parse_args()
+    return harness(args.expect_legacy, args.expect_listen)
 
 
 if __name__ == "__main__":

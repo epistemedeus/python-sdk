@@ -83,3 +83,63 @@ Records: `evidence/`.
 Run the locked command. Exit 1 means an open listen stream still holds shutdown on this source. Exit 0 means that stream's process now finishes inside 8 seconds and the idle and completed-request cases still do. The 3.6.0 command is the check that the legacy GET stream still drains while the listen stream is the case that changed.
 
 The production stop counts in the issue were not remeasured. Issue comments about main `af4c6f4` and the 6/0 `EventSourceResponse` count match the files above. The timings in those comments are not these runs.
+
+## Follow-through: explicit expectations and HTTP completion
+
+November 6, 2026. The original records above are unchanged. The runner now binds
+legacy and modern expectations separately. With Uvicorn held at 0.35.0 and the
+same SDK source, these are the measured legacy outcomes:
+
+| sse-starlette | Legacy process shutdown | Final HTTP chunk | Incomplete-response ASGI error | Modern listen |
+| --- | --- | --- | --- | --- |
+| 3.0.2 | Held at 8 seconds | Missing after cutoff | No | Held |
+| 3.0.4 | Held at 8 seconds | Missing after cutoff | No | Held |
+| 3.1.0 | 0.615 seconds | Missing | Yes | Held |
+| 3.1.2 | 0.565 seconds | Missing | Yes | Held |
+| 3.6.0 | 0.615 seconds | Missing | Yes | Held |
+
+This verifies a dependency-specific process-drain boundary, not a complete SSE
+response or an SDK repair. The source probe records each installed dependency's
+source hash and whether it contains `_shutdown_watcher`. It does not establish
+that raising a package floor alone repairs the modern handler.
+
+Pin both observed behaviors in one command:
+
+```bash
+uv run --frozen python reproductions/modern-sse-graceful-shutdown/repro/run_shutdown.py \
+  --expect-legacy held --expect-listen held
+
+uv run --frozen --with 'sse-starlette==3.1.2' --with 'uvicorn==0.35.0' \
+  python reproductions/modern-sse-graceful-shutdown/repro/run_shutdown.py \
+  --expect-legacy drains --expect-listen held
+```
+
+`held` means that the acknowledged/open stream's server remained alive at the
+cutoff. `drains` requires a normal process exit inside the bound. `clean` also
+requires receiving the terminating HTTP chunk and no incomplete-response ASGI
+error. Process exit alone does not satisfy `clean`. Legacy GET need not send an
+initial event; it is qualified by initialization 200, initialized notification
+202 and GET 200. Modern listen must send its actual subscription acknowledgment
+before SIGTERM. Framing is read only after the owned test server terminates.
+
+With explicit expectations, exit 0 means the selected profile matches, not that
+the SDK bug is fixed. Exit 1 means a valid case mismatched its selected profile.
+Exit 2 means setup or the idle/completed-request controls are invalid. The
+default command keeps its original behavior: legacy is record-only and an open
+modern stream still exits 1. `qualification` states the actual selected profile.
+
+Two real negative controls on 3.6.0 exit 1: asking for a `clean` legacy drain,
+and asking for the modern stream to `drain`. The default locked command also
+retains exit 1. All five dependency profiles and those three checks are stored
+under [`evidence/feedback-20261106/`](evidence/feedback-20261106/).
+
+Seven focused unit/wire tests cover both-generation selection, invalid setup,
+crashed-process refusal, and actual complete versus truncated chunked responses:
+
+```bash
+uv run --frozen python -m unittest discover \
+  -s reproductions/modern-sse-graceful-shutdown/repro -p test_shutdown.py -v
+```
+
+Only this reproduction changes. SDK implementation and dependency requirements
+remain unchanged. The bounded matrix does not remeasure production stop counts.
