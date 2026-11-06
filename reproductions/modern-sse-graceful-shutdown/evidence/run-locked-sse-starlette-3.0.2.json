@@ -1,0 +1,133 @@
+{
+  "cases": {
+    "idle": {
+      "hung": false,
+      "log": [
+        "INFO:     Waiting for application startup.",
+        "INFO:     Application startup complete.",
+        "INFO:     Uvicorn running on http://127.0.0.1:48395 (Press CTRL+C to quit)",
+        "INFO:     Shutting down",
+        "INFO:     Waiting for application shutdown.",
+        "INFO:     Finished server process [7792]"
+      ],
+      "name": "idle",
+      "ok": true,
+      "returncode": -15,
+      "seconds": 0.214,
+      "setup": {
+        "ok": true
+      }
+    },
+    "legacy_get": {
+      "hung": true,
+      "log": [
+        "INFO:     Waiting for application startup.",
+        "INFO:     Application startup complete.",
+        "INFO:     Uvicorn running on http://127.0.0.1:57331 (Press CTRL+C to quit)",
+        "INFO:     Shutting down",
+        "INFO:     Waiting for connections to close. (CTRL+C to force quit)"
+      ],
+      "name": "legacy_get",
+      "ok": true,
+      "returncode": -9,
+      "seconds": 8.007,
+      "setup": {
+        "content_type": "text/event-stream",
+        "initialize_status": 200,
+        "initialized_status": 202,
+        "ok": true,
+        "preview": "",
+        "status": 200
+      }
+    },
+    "listen": {
+      "hung": true,
+      "log": [
+        "INFO:     Waiting for application startup.",
+        "INFO:     Application startup complete.",
+        "INFO:     Uvicorn running on http://127.0.0.1:41679 (Press CTRL+C to quit)",
+        "INFO:     Shutting down",
+        "INFO:     Waiting for connections to close. (CTRL+C to force quit)"
+      ],
+      "name": "listen",
+      "ok": true,
+      "returncode": -9,
+      "seconds": 8.007,
+      "setup": {
+        "content_type": "text/event-stream",
+        "ok": true,
+        "preview": "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1},\"notifications\":{\"toolsListChanged\":true}}}\r\n\r\n",
+        "status": 200
+      }
+    },
+    "listen_grace_5": {
+      "hung": false,
+      "log": [
+        "INFO:     Waiting for application startup.",
+        "INFO:     Application startup complete.",
+        "INFO:     Uvicorn running on http://127.0.0.1:56019 (Press CTRL+C to quit)",
+        "INFO:     Shutting down",
+        "INFO:     Waiting for connections to close. (CTRL+C to force quit)",
+        "ERROR:    Cancel 1 running task(s), timeout graceful shutdown exceeded",
+        "INFO:     Waiting for application shutdown.",
+        "ERROR:    Exception in ASGI application",
+        "asyncio.exceptions.CancelledError: Task cancelled, timeout graceful shutdown exceeded",
+        "INFO:     Finished server process [7805]"
+      ],
+      "name": "listen_grace_5",
+      "ok": true,
+      "returncode": -15,
+      "seconds": 5.18,
+      "setup": {
+        "content_type": "text/event-stream",
+        "ok": true,
+        "preview": "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1},\"notifications\":{\"toolsListChanged\":true}}}\r\n\r\n",
+        "status": 200
+      }
+    },
+    "modern_closed": {
+      "hung": false,
+      "log": [
+        "INFO:     Waiting for application startup.",
+        "INFO:     Application startup complete.",
+        "INFO:     Uvicorn running on http://127.0.0.1:55101 (Press CTRL+C to quit)",
+        "INFO:     Shutting down",
+        "INFO:     Waiting for application shutdown.",
+        "INFO:     Finished server process [7795]"
+      ],
+      "name": "modern_closed",
+      "ok": true,
+      "returncode": -15,
+      "seconds": 0.164,
+      "setup": {
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"cacheScope\":\"private\",\"resultType\":\"complete\",\"tools\":[{\"description\":\"\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"title\":\"pingArguments\"},\"name\":\"ping\",\"outputSchema\":{\"properties\":{\"result\":{\"title\":\"Result\",\"type\":\"string\"}},\"required\":[\"result\"],\"title\":\"pingOutput\",\"type\":\"object\"}}],\"ttlMs\":0,\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"shutdown-repro\",\"version\":\"\"}}}}",
+        "content_type": "application/json",
+        "ok": true,
+        "session_id": null,
+        "status": 200
+      }
+    }
+  },
+  "disposition": "hang-reproduced",
+  "exit": 1,
+  "git_head": "bbf500a79d031cfcee0da087a15b2f08f0b23667",
+  "grace_bound_seconds": 12.0,
+  "grace_seconds": 5.0,
+  "hang_bound_seconds": 8.0,
+  "packages": {
+    "mcp": "0.0.1.dev1038+bbf500a",
+    "sse-starlette": "3.0.2",
+    "uvicorn": "0.35.0"
+  },
+  "python": "3.12.3",
+  "source": {
+    "legacy_event_source_response": 6,
+    "legacy_file": "/home/ubuntu/ae14-work/nov06-p5-rd-programme-5/src/mcp/server/streamable_http.py",
+    "modern_end_of_stream": 2,
+    "modern_event_source_response": 0,
+    "modern_file": "/home/ubuntu/ae14-work/nov06-p5-rd-programme-5/src/mcp/server/_streamable_http_modern.py",
+    "modern_sha256": "f8286b4b61f14d1cf3166a4236d46b08bf59dd8eb63fbd658a97c6c7fa8a714f",
+    "modern_should_exit": false,
+    "modern_watch_disconnect": true
+  }
+}
